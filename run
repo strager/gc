@@ -4,5 +4,6 @@ set -e
 set -u
 set -o pipefail
 
-LD_PRELOAD="${PWD}/libgc.so" top
-#ltrace -o top.ltrace -e 'memalign+malloc+free+calloc+realloc+reallocarray+valloc+posix_memalign+aligned_alloc' top
+#ltrace -o top.ltrace -e 'memalign+malloc+free+calloc+realloc+reallocarray+valloc+posix_memalign+aligned_alloc' env LD_PRELOAD="${PWD}/libgc.so" top
+export LD_PRELOAD="${PWD}/libgc.so"
+exec htop
