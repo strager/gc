@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -e
+set -u
+set -o pipefail
+
+LD_PRELOAD="${PWD}/libgc.so" top
+#ltrace -o top.ltrace -e 'memalign+malloc+free+calloc+realloc+reallocarray+valloc+posix_memalign+aligned_alloc' top
