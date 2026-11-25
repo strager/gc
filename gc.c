@@ -24,7 +24,8 @@ static void GC_printf(const char *format, ...);
 typedef struct GC_Chunk {
   char *start;
   char *end;              // &start[total_size] (one past the end)
-  size_t remaining_size;  // In bytes.
+  size_t total_size;      // In bytes.
+  size_t object_count;    // total_size / size_class
   size_t size_class;
   // TODO(strager): Should we remove this linked list?
   struct GC_Chunk *next;
@@ -114,7 +115,7 @@ static void GC_dump_chunks() {
   GC_printf("--- GC chunk dump % 7d ---\n", dump_counter);
   GC_Chunk *c = GC_chunks;
   while (c != nullptr) {
-    GC_printf("%p: % 10zu  %p..%p  %zuB free\n", c, c->size_class, c->start, c->end, c->remaining_size);
+    GC_printf("%p: % 10zu  %p..%p\n", c, c->size_class, c->start, c->end);
     c = c->next;
   }
   GC_printf("--- GC chunk dump end ---\n");
@@ -134,9 +135,8 @@ static void GC_chunk_set_object_tag(GC_Chunk *c, size_t i, GC_ObjectTag tag) {
 static void GC_dump_chunk_objects(GC_Chunk *c) {
   GC_printf("--- GC chunk object dump %p ---\n", c);
   size_t i = 0;
-  size_t object_count = ((c->end - c->start) - c->remaining_size) / c->size_class;
   char *p = c->start;
-  while (i < object_count) {
+  while (i < c->object_count) {
     GC_ObjectTag tag = GC_chunk_get_object_tag(c, i);
     GC_printf("%p: %c\n", p, tag == GC_ObjectTag_Used ? 'M' : ' ');
     i += 1;
@@ -255,51 +255,6 @@ static void GC_dealloc_pages(void *p, size_t size) {
   }
 }
 
-static GC_Chunk *GC_find_or_make_chunk(size_t size_class, size_t size_needed) {
-  GC_Chunk **c = &GC_chunks;
-  while (*c != nullptr) {
-    if ((*c)->size_class == size_class && (*c)->remaining_size >= size_needed) {
-      return *c;
-    }
-    c = &(*c)->next;
-  }
-
-  size_t object_count = GC_chunk_object_count_for_size_class(size_class);
-  GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
-  size_t chunk_total_size = object_count * size_class;
-  assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
-  chunk->remaining_size = chunk_total_size;
-  chunk->size_class = size_class;
-  chunk->next = nullptr;
-  chunk->start = GC_alloc_pages(chunk_total_size, "gcU");
-  chunk->end = &chunk->start[chunk_total_size];
-  *c = chunk;
-
-  GC_ChunkMapLevelIndexes chunkmap_start_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->start));
-  GC_ChunkMapLevelIndexes chunkmap_end_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->end) - 1);
-  if (GC_chunkmap_level1 == nullptr) {
-    GC_chunkmap_level1 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel1Bits), "gcC");
-  }
-  for (size_t level1_index = chunkmap_start_indexes.level1; level1_index <= chunkmap_end_indexes.level1; level1_index += 1) {
-    GC_ChunkMapLevel **level2 = &GC_chunkmap_level1->children[level1_index];
-    if (*level2 == nullptr) {
-        *level2 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel2Bits), "gcC");
-    }
-    for (size_t level2_index = chunkmap_start_indexes.level2; level2_index <= chunkmap_end_indexes.level2; level2_index += 1) {
-      GC_ChunkMapLevel **level3 = &(*level2)->children[level2_index];
-      if (*level3 == nullptr) {
-        *level3 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel3Bits), "gcC");
-      }
-      for (size_t level3_index = chunkmap_start_indexes.level3; level3_index <= chunkmap_end_indexes.level3; level3_index += 1) {
-        assert((*level3)->chunks[level3_index] == nullptr);
-        (*level3)->chunks[level3_index] = chunk;
-      }
-    }
-  }
-
-  return chunk;
-}
-
 typedef struct {
   void **start;
   void **end;
@@ -339,6 +294,15 @@ static void GC_work_queue_add(GC_WorkQueueItem item) {
   q->count += 1;
 }
 
+static void *GC_object_start_from_chunk_pointer(GC_Chunk *c, void *p) {
+  uintptr_t start_misalignment = (uintptr_t)(c->start) & (c->size_class - 1);
+  return (void *)((((uintptr_t)(p) - start_misalignment) & ~(c->size_class - 1)) + start_misalignment);
+}
+
+static size_t GC_object_index_from_object_start(GC_Chunk *c, void *p) {
+  return ((uintptr_t)(p) - (uintptr_t)(c->start)) / c->size_class;
+}
+
 static void GC_mark_sweep() {
   GC_unmanaged_low_count = 0;
   GC_unmanaged_high_count = 0;
@@ -371,8 +335,7 @@ static void GC_mark_sweep() {
   // Set tags for all objects to GC_ObjectTag_Free.
   GC_Chunk *c = GC_chunks;
   while (c != nullptr) {
-    size_t object_count = ((uintptr_t)(c->end) - (uintptr_t)(c->start)) / c->size_class;
-    memset(c->tags, 0, (object_count+7)/8);
+    memset(c->tags, 0, (c->object_count+7)/8);
     c = c->next;
   }
 
@@ -390,9 +353,8 @@ static void GC_mark_sweep() {
         continue;
       }
 
-      uintptr_t start_misalignment = (uintptr_t)(c->start) & (c->size_class - 1);
-      uintptr_t object_start = (((uintptr_t)(p) - start_misalignment) & ~(c->size_class - 1)) + start_misalignment;
-      size_t object_index = (object_start - (uintptr_t)(c->start)) / c->size_class;
+      void *object_start = GC_object_start_from_chunk_pointer(c, p);
+      size_t object_index = GC_object_index_from_object_start(c, object_start);
 
       GC_ObjectTag tag = GC_chunk_get_object_tag(c, object_index);
       if (tag == GC_ObjectTag_Free) {
@@ -425,14 +387,77 @@ void *aligned_alloc(size_t alignment, size_t size) {
   if (size < alignment) size = alignment;
   size_t size_class = GC_size_class_for_size(size, alignment);
   GC_lock();
-  GC_Chunk *chunk = GC_find_or_make_chunk(size_class, size);
-  char *result = &chunk->end[-chunk->remaining_size];
-  chunk->remaining_size -= size_class;
-
   GC_alloc_count += 1;
   if (GC_alloc_count % 64 == 0) {
     GC_mark_sweep();
   }
+
+  char *result = nullptr;
+  GC_Chunk **c = &GC_chunks;
+  while (*c != nullptr) {
+    if ((*c)->size_class == size_class) {
+      for (size_t i = 0; i < ((*c)->object_count+7)/8; i += 1) {
+        uint8_t tag_byte = (*c)->tags[i];
+        _Static_assert(GC_ObjectTag_Free == 0);
+        _Static_assert(GC_ObjectTag_Used == 1);
+        if (tag_byte != 0xff) {
+          uint8_t bit = stdc_first_trailing_zero(tag_byte) - 1;
+          size_t object_index = i*8 + bit;
+          if (object_index >= (*c)->object_count) {
+            // This happens if object_size==1, for example.
+            break;  // Try the next chunk.
+          }
+          GC_chunk_set_object_tag(*c, object_index, GC_ObjectTag_Used);
+          result = (*c)->start + object_index*size_class;
+          goto found;
+        }
+      }
+    }
+    c = &(*c)->next;
+  }
+  assert(result == nullptr);
+
+  size_t object_count = GC_chunk_object_count_for_size_class(size_class);
+  GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
+  // chunk->tags is filled with GC_ObjectTag_Free.
+
+  size_t chunk_total_size = object_count * size_class;
+  assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
+  chunk->total_size = chunk_total_size;
+  chunk->object_count = object_count;
+  chunk->size_class = size_class;
+  chunk->next = nullptr;
+  chunk->start = GC_alloc_pages(chunk_total_size, "gcU");
+  chunk->end = &chunk->start[chunk_total_size];
+  *c = chunk;
+
+  result = chunk->start;
+  GC_chunk_set_object_tag(chunk, 0, GC_ObjectTag_Used);
+
+  GC_ChunkMapLevelIndexes chunkmap_start_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->start));
+  GC_ChunkMapLevelIndexes chunkmap_end_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->end) - 1);
+  if (GC_chunkmap_level1 == nullptr) {
+    GC_chunkmap_level1 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel1Bits), "gcC");
+  }
+  for (size_t level1_index = chunkmap_start_indexes.level1; level1_index <= chunkmap_end_indexes.level1; level1_index += 1) {
+    GC_ChunkMapLevel **level2 = &GC_chunkmap_level1->children[level1_index];
+    if (*level2 == nullptr) {
+      *level2 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel2Bits), "gcC");
+    }
+    for (size_t level2_index = chunkmap_start_indexes.level2; level2_index <= chunkmap_end_indexes.level2; level2_index += 1) {
+      GC_ChunkMapLevel **level3 = &(*level2)->children[level2_index];
+      if (*level3 == nullptr) {
+        *level3 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel3Bits), "gcC");
+      }
+      for (size_t level3_index = chunkmap_start_indexes.level3; level3_index <= chunkmap_end_indexes.level3; level3_index += 1) {
+        assert((*level3)->chunks[level3_index] == nullptr);
+        (*level3)->chunks[level3_index] = chunk;
+      }
+    }
+  }
+
+ found:
+  assert(result != nullptr);
   GC_unlock();
   memset(result, 0, size);
   return result;
