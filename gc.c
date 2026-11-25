@@ -28,8 +28,14 @@ typedef struct GC_Chunk {
   size_t size_class;
   // TODO(strager): Should we remove this linked list?
   struct GC_Chunk *next;
-  uint8_t marks[];        // One bit per object.
+  uint8_t tags[];         // Packed array of GC_ObjectTag-s.
 } GC_Chunk;
+
+// 1 bit
+typedef enum {
+  GC_ObjectTag_Free = 0,
+  GC_ObjectTag_Used = 1,
+} GC_ObjectTag;
 
 typedef struct GC_ChunkMapLevel {
   union {
@@ -115,16 +121,24 @@ static void GC_dump_chunks() {
   dump_counter += 1;
 }
 
+static GC_ObjectTag GC_chunk_get_object_tag(GC_Chunk *c, size_t i) {
+  return (c->tags[i/8] >> (i & 7)) & 1;
+}
+
+static void GC_chunk_set_object_tag(GC_Chunk *c, size_t i, GC_ObjectTag tag) {
+  uint8_t mask = UINT8_C(1) << (i&7);
+  uint8_t bit = (uint8_t)(tag) << (i&7);
+  c->tags[i/8] = (c->tags[i/8] & ~mask) | bit;
+}
+
 static void GC_dump_chunk_objects(GC_Chunk *c) {
   GC_printf("--- GC chunk object dump %p ---\n", c);
   size_t i = 0;
   size_t object_count = ((c->end - c->start) - c->remaining_size) / c->size_class;
   char *p = c->start;
   while (i < object_count) {
-    size_t mark_byte_index = i/8;
-    size_t mark_bit = 1 << (i & 7);
-    bool was_marked = (c->marks[mark_byte_index] & mark_bit) != 0;
-    GC_printf("%p: %c\n", p, was_marked ? 'M' : ' ');
+    GC_ObjectTag tag = GC_chunk_get_object_tag(c, i);
+    GC_printf("%p: %c\n", p, tag == GC_ObjectTag_Used ? 'M' : ' ');
     i += 1;
     p += c->size_class;
   }
@@ -354,11 +368,11 @@ static void GC_mark_sweep() {
   }
   GC_procmaps_close(&procmaps);
 
-  // Clear marks.
+  // Set tags for all objects to GC_ObjectTag_Free.
   GC_Chunk *c = GC_chunks;
   while (c != nullptr) {
     size_t object_count = ((uintptr_t)(c->end) - (uintptr_t)(c->start)) / c->size_class;
-    memset(c->marks, 0, (object_count+7)/8);
+    memset(c->tags, 0, (object_count+7)/8);
     c = c->next;
   }
 
@@ -380,11 +394,9 @@ static void GC_mark_sweep() {
       uintptr_t object_start = (((uintptr_t)(p) - start_misalignment) & ~(c->size_class - 1)) + start_misalignment;
       size_t object_index = (object_start - (uintptr_t)(c->start)) / c->size_class;
 
-      size_t mark_byte_index = object_index/8;
-      size_t mark_bit = 1 << (object_index & 7);
-      bool was_marked = (c->marks[mark_byte_index] & mark_bit) != 0;
-      if (!was_marked) {
-        c->marks[mark_byte_index] |= mark_bit;
+      GC_ObjectTag tag = GC_chunk_get_object_tag(c, object_index);
+      if (tag == GC_ObjectTag_Free) {
+        GC_chunk_set_object_tag(c, object_index, GC_ObjectTag_Used);
         GC_work_queue_add((GC_WorkQueueItem){
             .start = (void **)(object_start),
             .end = (void **)(object_start + c->size_class),
