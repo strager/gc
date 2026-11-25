@@ -41,15 +41,24 @@ static size_t GC_chunkmaplevel_alloc_size(size_t child_count) {
   return sizeof(GC_Chunk *) * child_count;
 }
 
+static uint64_t GC_unmanaged_low_count = 0;
+static uint64_t GC_unmanaged_high_count = 0;
+static uint64_t GC_unmanaged_l1_count = 0;
+static uint64_t GC_unmanaged_l2_count = 0;
+static uint64_t GC_unmanaged_l3_count = 0;
+static uint64_t GC_managed_count = 0;
+
 enum {
   GC_ChunkAllocationGranularityBits = 12,
+  GC_ChunkAllocationPointerBits = 48,
+  GC_ChunkAllocationPointerMax = (UINT64_C(1) << GC_ChunkAllocationPointerBits) - 1,
 };
 
 enum {
   GC_ChunkMapLevel4Bits = GC_ChunkAllocationGranularityBits,
-  GC_ChunkMapLevel3Bits = 18,
-  GC_ChunkMapLevel2Bits = 18,
-  GC_ChunkMapLevel1Bits = 64 - (GC_ChunkMapLevel2Bits+GC_ChunkMapLevel3Bits+GC_ChunkMapLevel4Bits),
+  GC_ChunkMapLevel3Bits = 12,
+  GC_ChunkMapLevel2Bits = 12,
+  GC_ChunkMapLevel1Bits = GC_ChunkAllocationPointerBits - (GC_ChunkMapLevel2Bits+GC_ChunkMapLevel3Bits+GC_ChunkMapLevel4Bits),
 };
 typedef struct {
   size_t level1;
@@ -169,20 +178,33 @@ static size_t GC_chunk_object_count_for_size_class(size_t size_class) {
 }
 
 static GC_Chunk *GC_find_chunk_for_pointer(void *p) {
-  GC_ChunkMapLevelIndexes indexes = GC_chunkmaplevel_indexes((uintptr_t)(p));
-
-  if (GC_chunkmap_level1 == nullptr) {
+  if ((uintptr_t)(p) < (1<<GC_ChunkAllocationGranularityBits)) {
+    GC_unmanaged_low_count += 1;
     return nullptr;
   }
+  if ((uintptr_t)(p) >= GC_ChunkAllocationPointerMax) {
+    GC_unmanaged_high_count += 1;
+    return nullptr;
+  }
+  GC_ChunkMapLevelIndexes indexes = GC_chunkmaplevel_indexes((uintptr_t)(p));
+
   GC_ChunkMapLevel *level2 = GC_chunkmap_level1->children[indexes.level1];
   if (level2 == nullptr) {
+    GC_unmanaged_l1_count += 1;
     return nullptr;
   }
   GC_ChunkMapLevel *level3 = level2->children[indexes.level2];
   if (level3 == nullptr) {
+    GC_unmanaged_l2_count += 1;
     return nullptr;
   }
-  return level3->chunks[indexes.level3];
+  GC_Chunk *chunk = level3->chunks[indexes.level3];
+  if (chunk == nullptr) {
+    GC_unmanaged_l3_count += 1;
+    return nullptr;
+  }
+  GC_managed_count += 1;
+  return chunk;
 }
 
 static void *GC_alloc_pages(size_t size, const char *tag) {
@@ -301,6 +323,13 @@ static void GC_work_queue_add(GC_WorkQueueItem item) {
 }
 
 static void GC_mark_sweep() {
+  GC_unmanaged_low_count = 0;
+  GC_unmanaged_high_count = 0;
+  GC_unmanaged_l1_count = 0;
+  GC_unmanaged_l2_count = 0;
+  GC_unmanaged_l3_count = 0;
+  GC_managed_count = 0;
+
   // Find roots.
   GC_ProcMaps procmaps;
   GC_procmaps_open(&procmaps);
@@ -359,6 +388,19 @@ static void GC_mark_sweep() {
           });
       }
     }
+  }
+
+  if (false) {
+    uint64_t unmanaged_count = GC_unmanaged_low_count + GC_unmanaged_high_count + GC_unmanaged_l1_count + GC_unmanaged_l2_count + GC_unmanaged_l3_count;
+    GC_printf("scanned pointers: managed=%zu unmanaged=%zu (low=%zu high=%zu l1=%zu l2=%zu l3=%zu), %f%% unmanaged\n",
+      GC_managed_count,
+      unmanaged_count,
+      GC_unmanaged_low_count,
+      GC_unmanaged_high_count,
+      GC_unmanaged_l1_count,
+      GC_unmanaged_l2_count,
+      GC_unmanaged_l3_count,
+      100.0 * (double)(unmanaged_count) / (double)(GC_managed_count+unmanaged_count));
   }
 }
 
