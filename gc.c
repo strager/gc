@@ -11,19 +11,64 @@
 #include <sys/errno.h>
 #include <stdbit.h>
 #include <sys/mman.h>
-#include <assert.h>
+
+static void GC_printf(const char *format, ...);
+#define assert(cond)                                                    \
+  do {                                                                  \
+    if (!(cond)) {                                                      \
+      GC_printf("%s:%d: assert failed: %s\n", __FILE__, __LINE__, #cond); \
+      __builtin_trap();                                                 \
+    }                                                                   \
+  } while (false)
 
 typedef struct GC_Chunk {
   char *start;
   char *end;              // &start[total_size] (one past the end)
   size_t remaining_size;  // In bytes.
   size_t size_class;
+  // TODO(strager): Should we remove this linked list?
   struct GC_Chunk *next;
   uint8_t marks[];        // One bit per object.
 } GC_Chunk;
 
+typedef struct GC_ChunkMapLevel {
+  union {
+    struct GC_ChunkMapLevel *children[];
+    struct GC_Chunk *chunks[];
+  };
+} GC_ChunkMapLevel;
+static size_t GC_chunkmaplevel_alloc_size(size_t child_count) {
+  return sizeof(GC_Chunk *) * child_count;
+}
+
+enum {
+  GC_ChunkAllocationGranularityBits = 12,
+};
+
+enum {
+  GC_ChunkMapLevel4Bits = GC_ChunkAllocationGranularityBits,
+  GC_ChunkMapLevel3Bits = 18,
+  GC_ChunkMapLevel2Bits = 18,
+  GC_ChunkMapLevel1Bits = 64 - (GC_ChunkMapLevel2Bits+GC_ChunkMapLevel3Bits+GC_ChunkMapLevel4Bits),
+};
+typedef struct {
+  size_t level1;
+  size_t level2;
+  size_t level3;
+} GC_ChunkMapLevelIndexes;
+static GC_ChunkMapLevelIndexes GC_chunkmaplevel_indexes(uintptr_t p) {
+  GC_ChunkMapLevelIndexes result;
+  p >>= GC_ChunkMapLevel4Bits;
+  result.level3 = p & ((UINT64_C(1)<<GC_ChunkMapLevel3Bits) - 1); p >>= GC_ChunkMapLevel3Bits;
+  result.level2 = p & ((UINT64_C(1)<<GC_ChunkMapLevel2Bits) - 1); p >>= GC_ChunkMapLevel2Bits;
+  assert(p < (UINT64_C(1)<<GC_ChunkMapLevel1Bits));
+  result.level1 = p;
+  return result;
+}
+
 static pthread_mutex_t GC_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static GC_ChunkMapLevel *GC_chunkmap_level1 = nullptr;
 static GC_Chunk *GC_chunks = nullptr;
 
 static void GC_lock() {
@@ -74,28 +119,70 @@ static void GC_dump_chunk_objects(GC_Chunk *c) {
   GC_printf("--- GC chunk object dump end ---\n");
 }
 
+static void GC_dump_chunkmap() {
+  GC_printf("--- GC chunkmap dump ---\n");
+  GC_ChunkMapLevel *level1 = GC_chunkmap_level1;
+  if (level1 != nullptr) {
+    for (size_t level1_index = 0; level1_index < UINT64_C(1)<< GC_ChunkMapLevel1Bits; level1_index += 1) {
+      GC_ChunkMapLevel *level2 = level1->children[level1_index];
+      if (level2 != nullptr) {
+        uintptr_t level2_total_bits = GC_ChunkMapLevel2Bits+GC_ChunkMapLevel3Bits+GC_ChunkMapLevel4Bits;
+        uintptr_t level2_p = level1_index << level2_total_bits;
+        GC_printf("- %p..%p\n", (void*)(level2_p), (void*)(level2_p + (UINT64_C(1)<<level2_total_bits)-1));
+
+        for (size_t level2_index = 0; level2_index < UINT64_C(1)<< GC_ChunkMapLevel2Bits; level2_index += 1) {
+          GC_ChunkMapLevel *level3 = level2->children[level2_index];
+          if (level3 != nullptr) {
+            uintptr_t level3_total_bits = GC_ChunkMapLevel3Bits+GC_ChunkMapLevel4Bits;
+            uintptr_t level3_p = (level2_index << level3_total_bits) | level2_p;
+            GC_printf("  - %p..%p\n", (void*)(level3_p), (void*)(level3_p + (UINT64_C(1)<<level3_total_bits)-1));
+
+            for (size_t level3_index = 0; level3_index < UINT64_C(1)<< GC_ChunkMapLevel3Bits; level3_index += 1) {
+              uintptr_t level4_total_bits = GC_ChunkMapLevel4Bits;
+              uintptr_t level4_p = (level3_index << level4_total_bits) | level3_p;
+
+              GC_Chunk *chunk = level3->chunks[level3_index];
+              if (chunk != nullptr) {
+                GC_printf("    - %p..%p  chunk=%p %p..%p\n",
+                  (void*)(level4_p), (void*)(level4_p + (UINT64_C(1)<<level4_total_bits)-1),
+                  chunk, chunk->start, chunk->end-1);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  GC_printf("--- GC chunkmap dump end ---\n");
+}
+
 static size_t GC_size_class_for_size(size_t size, size_t alignment) {
   assert(size >= alignment);
   return stdc_bit_ceil(size);
 }
 
 static size_t GC_chunk_object_count_for_size_class(size_t size_class) {
-  if (size_class <= 1024) {
-    return 1<<16;
+  if (size_class <= (1<<GC_ChunkAllocationGranularityBits)) {
+    return (1<<GC_ChunkAllocationGranularityBits)/size_class;
   }
   return 1;
 }
 
 static GC_Chunk *GC_find_chunk_for_pointer(void *p) {
-  if (p == nullptr) return nullptr;
-  GC_Chunk *c = GC_chunks;
-  while (c != nullptr) {
-    if ((uintptr_t)(c->start) <= (uintptr_t)(p) && (uintptr_t)(p) < (uintptr_t)(c->end)) {
-      return c;
-    }
-    c = c->next;
+  GC_ChunkMapLevelIndexes indexes = GC_chunkmaplevel_indexes((uintptr_t)(p));
+
+  if (GC_chunkmap_level1 == nullptr) {
+    return nullptr;
   }
-  return nullptr;
+  GC_ChunkMapLevel *level2 = GC_chunkmap_level1->children[indexes.level1];
+  if (level2 == nullptr) {
+    return nullptr;
+  }
+  GC_ChunkMapLevel *level3 = level2->children[indexes.level2];
+  if (level3 == nullptr) {
+    return nullptr;
+  }
+  return level3->chunks[indexes.level3];
 }
 
 static void *GC_alloc_pages(size_t size, const char *tag) {
@@ -141,12 +228,36 @@ static GC_Chunk *GC_find_or_make_chunk(size_t size_class, size_t size_needed) {
   size_t object_count = GC_chunk_object_count_for_size_class(size_class);
   GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
   size_t chunk_total_size = object_count * size_class;
+  assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
   chunk->remaining_size = chunk_total_size;
   chunk->size_class = size_class;
   chunk->next = nullptr;
   chunk->start = GC_alloc_pages(chunk_total_size, "gcU");
   chunk->end = &chunk->start[chunk_total_size];
   *c = chunk;
+
+  GC_ChunkMapLevelIndexes chunkmap_start_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->start));
+  GC_ChunkMapLevelIndexes chunkmap_end_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->end) - 1);
+  if (GC_chunkmap_level1 == nullptr) {
+    GC_chunkmap_level1 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel1Bits), "gcC");
+  }
+  for (size_t level1_index = chunkmap_start_indexes.level1; level1_index <= chunkmap_end_indexes.level1; level1_index += 1) {
+    GC_ChunkMapLevel **level2 = &GC_chunkmap_level1->children[level1_index];
+    if (*level2 == nullptr) {
+        *level2 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel2Bits), "gcC");
+    }
+    for (size_t level2_index = chunkmap_start_indexes.level2; level2_index <= chunkmap_end_indexes.level2; level2_index += 1) {
+      GC_ChunkMapLevel **level3 = &(*level2)->children[level2_index];
+      if (*level3 == nullptr) {
+        *level3 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel3Bits), "gcC");
+      }
+      for (size_t level3_index = chunkmap_start_indexes.level3; level3_index <= chunkmap_end_indexes.level3; level3_index += 1) {
+        assert((*level3)->chunks[level3_index] == nullptr);
+        (*level3)->chunks[level3_index] = chunk;
+      }
+    }
+  }
+
   return chunk;
 }
 
@@ -298,6 +409,9 @@ void *calloc(size_t a, size_t b) {
 size_t malloc_usable_size(void *p) {
   GC_lock();
   GC_Chunk *c = GC_find_chunk_for_pointer(p);
+  if (c == nullptr) {
+    __builtin_trap();
+  }
   size_t size_class = c->size_class;
   GC_unlock();
   return size_class;
