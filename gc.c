@@ -383,6 +383,31 @@ static void GC_mark_sweep() {
   GC_gc_count += 1;
 }
 
+static void *GC_alloc_nogrow(size_t size_class) {
+  GC_Chunk *c = GC_chunks;
+  while (c != nullptr) {
+    if (c->size_class == size_class) {
+      for (size_t i = 0; i < (c->object_count+7)/8; i += 1) {
+        uint8_t tag_byte = c->tags[i];
+        _Static_assert(GC_ObjectTag_Free == 0);
+        _Static_assert(GC_ObjectTag_Used == 1);
+        if (tag_byte != 0xff) {
+          uint8_t bit = stdc_first_trailing_zero(tag_byte) - 1;
+          size_t object_index = i*8 + bit;
+          if (object_index >= c->object_count) {
+            // This happens if object_size==1, for example.
+            break;  // Try the next chunk.
+          }
+          GC_chunk_set_object_tag(c, object_index, GC_ObjectTag_Used);
+          return c->start + object_index*size_class;
+        }
+      }
+    }
+    c = c->next;
+  }
+  return nullptr;
+}
+
 void *aligned_alloc(size_t alignment, size_t size) {
   if (size < alignment) size = alignment;
   size_t size_class = GC_size_class_for_size(size, alignment);
@@ -392,71 +417,49 @@ void *aligned_alloc(size_t alignment, size_t size) {
     GC_mark_sweep();
   }
 
-  char *result = nullptr;
-  GC_Chunk **c = &GC_chunks;
-  while (*c != nullptr) {
-    if ((*c)->size_class == size_class) {
-      for (size_t i = 0; i < ((*c)->object_count+7)/8; i += 1) {
-        uint8_t tag_byte = (*c)->tags[i];
-        _Static_assert(GC_ObjectTag_Free == 0);
-        _Static_assert(GC_ObjectTag_Used == 1);
-        if (tag_byte != 0xff) {
-          uint8_t bit = stdc_first_trailing_zero(tag_byte) - 1;
-          size_t object_index = i*8 + bit;
-          if (object_index >= (*c)->object_count) {
-            // This happens if object_size==1, for example.
-            break;  // Try the next chunk.
-          }
-          GC_chunk_set_object_tag(*c, object_index, GC_ObjectTag_Used);
-          result = (*c)->start + object_index*size_class;
-          goto found;
+  char *result = GC_alloc_nogrow(size_class);
+  if (result == nullptr) {
+    size_t object_count = GC_chunk_object_count_for_size_class(size_class);
+    GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
+    // chunk->tags is filled with GC_ObjectTag_Free.
+
+    size_t chunk_total_size = object_count * size_class;
+    assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
+    chunk->total_size = chunk_total_size;
+    chunk->object_count = object_count;
+    chunk->size_class = size_class;
+    chunk->start = GC_alloc_pages(chunk_total_size, "gcU");
+    chunk->end = &chunk->start[chunk_total_size];
+
+    chunk->next = GC_chunks;
+    GC_chunks = chunk;
+
+    result = chunk->start;
+    GC_chunk_set_object_tag(chunk, 0, GC_ObjectTag_Used);
+
+    GC_ChunkMapLevelIndexes chunkmap_start_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->start));
+    GC_ChunkMapLevelIndexes chunkmap_end_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->end) - 1);
+    if (GC_chunkmap_level1 == nullptr) {
+      GC_chunkmap_level1 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel1Bits), "gcC");
+    }
+    for (size_t level1_index = chunkmap_start_indexes.level1; level1_index <= chunkmap_end_indexes.level1; level1_index += 1) {
+      GC_ChunkMapLevel **level2 = &GC_chunkmap_level1->children[level1_index];
+      if (*level2 == nullptr) {
+        *level2 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel2Bits), "gcC");
+      }
+      for (size_t level2_index = chunkmap_start_indexes.level2; level2_index <= chunkmap_end_indexes.level2; level2_index += 1) {
+        GC_ChunkMapLevel **level3 = &(*level2)->children[level2_index];
+        if (*level3 == nullptr) {
+          *level3 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel3Bits), "gcC");
+        }
+        for (size_t level3_index = chunkmap_start_indexes.level3; level3_index <= chunkmap_end_indexes.level3; level3_index += 1) {
+          assert((*level3)->chunks[level3_index] == nullptr);
+          (*level3)->chunks[level3_index] = chunk;
         }
       }
     }
-    c = &(*c)->next;
-  }
-  assert(result == nullptr);
-
-  size_t object_count = GC_chunk_object_count_for_size_class(size_class);
-  GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
-  // chunk->tags is filled with GC_ObjectTag_Free.
-
-  size_t chunk_total_size = object_count * size_class;
-  assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
-  chunk->total_size = chunk_total_size;
-  chunk->object_count = object_count;
-  chunk->size_class = size_class;
-  chunk->next = nullptr;
-  chunk->start = GC_alloc_pages(chunk_total_size, "gcU");
-  chunk->end = &chunk->start[chunk_total_size];
-  *c = chunk;
-
-  result = chunk->start;
-  GC_chunk_set_object_tag(chunk, 0, GC_ObjectTag_Used);
-
-  GC_ChunkMapLevelIndexes chunkmap_start_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->start));
-  GC_ChunkMapLevelIndexes chunkmap_end_indexes = GC_chunkmaplevel_indexes((uintptr_t)(chunk->end) - 1);
-  if (GC_chunkmap_level1 == nullptr) {
-    GC_chunkmap_level1 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel1Bits), "gcC");
-  }
-  for (size_t level1_index = chunkmap_start_indexes.level1; level1_index <= chunkmap_end_indexes.level1; level1_index += 1) {
-    GC_ChunkMapLevel **level2 = &GC_chunkmap_level1->children[level1_index];
-    if (*level2 == nullptr) {
-      *level2 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel2Bits), "gcC");
-    }
-    for (size_t level2_index = chunkmap_start_indexes.level2; level2_index <= chunkmap_end_indexes.level2; level2_index += 1) {
-      GC_ChunkMapLevel **level3 = &(*level2)->children[level2_index];
-      if (*level3 == nullptr) {
-        *level3 = GC_alloc_pages(GC_chunkmaplevel_alloc_size(UINT64_C(1)<<GC_ChunkMapLevel3Bits), "gcC");
-      }
-      for (size_t level3_index = chunkmap_start_indexes.level3; level3_index <= chunkmap_end_indexes.level3; level3_index += 1) {
-        assert((*level3)->chunks[level3_index] == nullptr);
-        (*level3)->chunks[level3_index] = chunk;
-      }
-    }
   }
 
- found:
   assert(result != nullptr);
   GC_unlock();
   memset(result, 0, size);
