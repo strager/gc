@@ -57,9 +57,10 @@ static uint64_t GC_managed_count = 0;
 
 static uint64_t GC_alloc_count = 0;
 static uint64_t GC_gc_count = 0;
+static uint64_t GC_alloced_page_bytes_until_next_gc = 0;
 
 enum {
-  GC_ChunkAllocationGranularityBits = 12,
+  GC_ChunkAllocationGranularityBits = 12, // Decided by the operating system.
   GC_ChunkAllocationPointerBits = 48,
   GC_ChunkAllocationPointerMax = (UINT64_C(1) << GC_ChunkAllocationPointerBits) - 1,
 };
@@ -188,8 +189,9 @@ static size_t GC_size_class_for_size(size_t size, size_t alignment) {
 }
 
 static size_t GC_chunk_object_count_for_size_class(size_t size_class) {
-  if (size_class <= (1<<GC_ChunkAllocationGranularityBits)) {
-    return (1<<GC_ChunkAllocationGranularityBits)/size_class;
+  size_t min_chunk_size = 1<<16;
+  if (size_class <= min_chunk_size) {
+    return min_chunk_size/size_class;
   }
   return 1;
 }
@@ -304,6 +306,15 @@ static size_t GC_object_index_from_object_start(GC_Chunk *c, void *p) {
 }
 
 static void GC_mark_sweep() {
+  if (GC_chunkmap_level1 == nullptr || GC_chunks == nullptr) {
+    return;
+  }
+
+  struct timespec time_start;
+  clock_gettime(CLOCK_MONOTONIC, &time_start);
+
+  size_t live_bytes = 0;
+
   GC_unmanaged_low_count = 0;
   GC_unmanaged_high_count = 0;
   GC_unmanaged_l1_count = 0;
@@ -358,6 +369,7 @@ static void GC_mark_sweep() {
 
       GC_ObjectTag tag = GC_chunk_get_object_tag(c, object_index);
       if (tag == GC_ObjectTag_Free) {
+        live_bytes += c->size_class;
         GC_chunk_set_object_tag(c, object_index, GC_ObjectTag_Used);
         GC_work_queue_add((GC_WorkQueueItem){
             .start = (void **)(object_start),
@@ -380,7 +392,33 @@ static void GC_mark_sweep() {
       100.0 * (double)(unmanaged_count) / (double)(GC_managed_count+unmanaged_count));
   }
 
+  GC_alloced_page_bytes_until_next_gc = live_bytes;
+
   GC_gc_count += 1;
+  struct timespec time_end;
+  clock_gettime(CLOCK_MONOTONIC, &time_end);
+
+  struct timespec duration = {};
+  duration.tv_sec = time_end.tv_sec - time_start.tv_sec;
+  if (time_end.tv_nsec >= time_start.tv_nsec) {
+    duration.tv_nsec = time_end.tv_nsec - time_start.tv_nsec;
+  } else {
+    duration.tv_nsec = 1*1000*1000*1000 - (time_end.tv_nsec - time_start.tv_nsec);
+    duration.tv_sec -= 1;
+  }
+  if (false) {
+    GC_printf("GC #%zu took %lu.%06lu seconds after %zu allocations\n",
+      GC_gc_count,
+      (unsigned long)(duration.tv_sec),
+      (unsigned long)(duration.tv_nsec / 1000),
+      GC_alloc_count);
+
+    size_t total_bytes = 0;
+    for (GC_Chunk *c = GC_chunks; c != nullptr; c = c->next) {
+      total_bytes += c->end - c->start;
+    }
+    GC_printf("%zu/%zu bytes (%f%%) live\n", live_bytes, total_bytes, 100.0 * (double)(live_bytes) / (double)(total_bytes));
+  }
 }
 
 static void *GC_alloc_nogrow(size_t size_class) {
@@ -413,17 +451,23 @@ void *aligned_alloc(size_t alignment, size_t size) {
   size_t size_class = GC_size_class_for_size(size, alignment);
   GC_lock();
   GC_alloc_count += 1;
-  if (GC_alloc_count % 64 == 0) {
-    GC_mark_sweep();
-  }
-
   char *result = GC_alloc_nogrow(size_class);
   if (result == nullptr) {
     size_t object_count = GC_chunk_object_count_for_size_class(size_class);
+    size_t chunk_total_size = object_count * size_class;
+    if (chunk_total_size >= GC_alloced_page_bytes_until_next_gc) {
+      GC_mark_sweep();  // Updates GC_alloced_page_bytes_until_next_gc.
+      result = GC_alloc_nogrow(size_class);
+    } else {
+      GC_alloced_page_bytes_until_next_gc -= chunk_total_size;
+    }
+  }
+  if (result == nullptr) {
+    size_t object_count = GC_chunk_object_count_for_size_class(size_class);
+    size_t chunk_total_size = object_count * size_class;
     GC_Chunk *chunk = GC_alloc_pages(sizeof(GC_Chunk) + (sizeof(uint8_t)*object_count+7)/8, "gcC");
     // chunk->tags is filled with GC_ObjectTag_Free.
 
-    size_t chunk_total_size = object_count * size_class;
     assert(chunk_total_size >= (1<<GC_ChunkAllocationGranularityBits));
     chunk->total_size = chunk_total_size;
     chunk->object_count = object_count;
