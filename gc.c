@@ -48,6 +48,9 @@ static uint64_t GC_unmanaged_l2_count = 0;
 static uint64_t GC_unmanaged_l3_count = 0;
 static uint64_t GC_managed_count = 0;
 
+static uint64_t GC_alloc_count = 0;
+static uint64_t GC_gc_count = 0;
+
 enum {
   GC_ChunkAllocationGranularityBits = 12,
   GC_ChunkAllocationPointerBits = 48,
@@ -402,6 +405,8 @@ static void GC_mark_sweep() {
       GC_unmanaged_l3_count,
       100.0 * (double)(unmanaged_count) / (double)(GC_managed_count+unmanaged_count));
   }
+
+  GC_gc_count += 1;
 }
 
 void *aligned_alloc(size_t alignment, size_t size) {
@@ -412,7 +417,10 @@ void *aligned_alloc(size_t alignment, size_t size) {
   char *result = &chunk->end[-chunk->remaining_size];
   chunk->remaining_size -= size_class;
 
-  GC_mark_sweep();
+  GC_alloc_count += 1;
+  if (GC_alloc_count % 64 == 0) {
+    GC_mark_sweep();
+  }
   GC_unlock();
   memset(result, 0, size);
   return result;
