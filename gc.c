@@ -336,7 +336,11 @@ static void GC_mark_sweep() {
       100.0 * (double)(unmanaged_count) / (double)(GC.managed_count+unmanaged_count));
   }
 
-  GC.alloced_page_bytes_until_next_gc = live_bytes;
+  if (live_bytes < GC.total_user_bytes*.25) {
+    GC.alloced_page_bytes_until_next_gc = 0;
+  } else {
+    GC.alloced_page_bytes_until_next_gc = live_bytes*.50;
+  }
 
   GC.gc_count += 1;
   struct timespec time_end;
@@ -357,11 +361,7 @@ static void GC_mark_sweep() {
       (unsigned long)(duration.tv_nsec / 1000),
       GC.alloc_count);
 
-    size_t total_bytes = 0;
-    for (GC_Chunk *c = GC.chunks; c != nullptr; c = c->next) {
-      total_bytes += c->end - c->start;
-    }
-    GC_printf("%zu/%zu bytes (%f%%) live\n", live_bytes, total_bytes, 100.0 * (double)(live_bytes) / (double)(total_bytes));
+    GC_printf("%zu/%zu bytes (%f%%) live\n", live_bytes, GC.total_user_bytes, 100.0 * (double)(live_bytes) / (double)(GC.total_user_bytes));
   }
 }
 
@@ -460,6 +460,7 @@ void *aligned_alloc(size_t alignment, size_t size) {
 
     chunk->next = GC.chunks;
     GC.chunks = chunk;
+    GC.total_user_bytes += chunk_total_size;
 
     result = chunk->start;
     GC_chunk_set_object_tag(chunk, 0, GC_ObjectTag_Used);

@@ -1,5 +1,6 @@
 #include "imgui.h"
 #include <string.h>
+#include <map>
 #include <vector>
 #include <math.h>
 #include <signal.h>
@@ -178,6 +179,15 @@ int main(int argc, char **argv) {
         ImGui::Text("alloc_count = %lu", gc.alloc_count);
         ImGui::Text("gc_count = %lu", gc.gc_count);
         ImGui::Text("chunks.count = %zu", chunk_metas.size());
+        {
+          std::map<size_t, size_t> count_by_size_class = {};
+          for (ChunkMeta &c : chunk_metas) {
+            count_by_size_class[c.header.size_class] += 1;
+          }
+          for (auto p : count_by_size_class) {
+            ImGui::Text("chunks.count(size_class=%zu) = %zu", p.first, p.second);
+          }
+        }
 
         std::vector<uint8_t> tags;
         for (ChunkMeta &c : chunk_metas) {

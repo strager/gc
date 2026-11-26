@@ -48,6 +48,8 @@ typedef struct {
   uint64_t gc_count;
   uint64_t alloced_page_bytes_until_next_gc;
 
+  uint64_t total_user_bytes;
+
   GC_ChunkMapLevel *chunkmap_level1;
   GC_Chunk *chunks;
 
